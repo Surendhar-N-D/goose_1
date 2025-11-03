@@ -54,6 +54,7 @@ pub struct AnthropicProvider {
     api_client: ApiClient,
     model: ModelConfig,
     supports_streaming: bool,
+    custom_headers: Option<HashMap<String, String>>,
     name: String,
     custom_models: Option<Vec<String>>,
 }
@@ -80,6 +81,7 @@ impl AnthropicProvider {
             api_client,
             model,
             supports_streaming: true,
+            custom_headers: None,
             name: ANTHROPIC_PROVIDER_NAME.to_string(),
             custom_models: None,
         })
@@ -137,6 +139,7 @@ impl AnthropicProvider {
             api_client,
             model,
             supports_streaming,
+            custom_headers: config.headers,
             name: config.name.clone(),
             custom_models,
         })
@@ -285,6 +288,11 @@ impl Provider for AnthropicProvider {
                 let mut request = self.api_client.request(Some(session_id), "v1/messages");
                 for (key, value) in &conditional_headers {
                     request = request.header(key, value)?;
+                }
+                if let Some(custom_headers) = &self.custom_headers {
+                    for (key, value) in custom_headers {
+                        request = request.header(key, value)?;
+                    }
                 }
                 let resp = request.response_post(&payload).await?;
                 handle_status_openai_compat(resp).await
