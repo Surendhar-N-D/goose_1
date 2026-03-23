@@ -805,6 +805,7 @@ mod tests {
             socket: None,
             bundled: Some(false),
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         &[
             r#"mcp_servers.lookup.url="http://localhost/mcp""#,
@@ -824,6 +825,7 @@ mod tests {
             socket: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         &[
             r#"mcp_servers.mcp_kiwi_com.url="https://mcp.kiwi.com""#,
