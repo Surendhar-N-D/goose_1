@@ -538,6 +538,10 @@ pub fn create_request(
 ) -> Result<Value> {
     let anthropic_messages = format_messages(messages);
     let tool_specs = format_tools(tools);
+    {
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+        eprintln!("[ANTHROPIC_TOOLS] Sending {} tools to LLM: {:?}", tools.len(), names);
+    }
     let system_spec = format_system(system);
 
     if anthropic_messages.is_empty() {

@@ -169,6 +169,8 @@ impl OpenAiProvider {
             custom_headers: None,
             supports_streaming: true,
             name: OPEN_AI_PROVIDER_NAME.to_string(),
+            custom_models: None,
+            skip_canonical_filtering: false,
         })
     }
 
