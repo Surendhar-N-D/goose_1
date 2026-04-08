@@ -8,12 +8,13 @@ use std::io;
 use tokio::pin;
 use tokio_util::io::StreamReader;
 
-use super::api_client::{ApiClient, AuthMethod};
+use super::api_client::{ApiClient, ApiResponse, AuthMethod};
 use super::base::{ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata};
 use super::errors::ProviderError;
 use super::formats::anthropic::{
     create_request, response_to_streaming_message, thinking_type, ThinkingType,
 };
+use serde_json::json;
 use super::openai_compatible::handle_status_openai_compat;
 use super::openai_compatible::map_http_error_to_provider_error;
 use super::retry::ProviderRetry;
@@ -23,6 +24,7 @@ use crate::model::ModelConfig;
 use crate::providers::utils::RequestLog;
 use futures::future::BoxFuture;
 use rmcp::model::Tool;
+use std::collections::HashMap;
 
 const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-5";
@@ -54,6 +56,7 @@ pub struct AnthropicProvider {
     api_client: ApiClient,
     model: ModelConfig,
     supports_streaming: bool,
+    custom_headers: Option<HashMap<String, String>>,
     name: String,
     custom_models: Option<Vec<String>>,
 }
@@ -80,6 +83,7 @@ impl AnthropicProvider {
             api_client,
             model,
             supports_streaming: true,
+            custom_headers: None,
             name: ANTHROPIC_PROVIDER_NAME.to_string(),
             custom_models: None,
         })
@@ -137,8 +141,33 @@ impl AnthropicProvider {
             api_client,
             model,
             supports_streaming,
+            custom_headers: config.headers,
             name: config.name.clone(),
             custom_models,
+        })
+    }
+
+    /// Create an AnthropicProvider with an explicit API key (for per-session provider switching).
+    pub fn from_api_key(model: ModelConfig, api_key: &str) -> Result<Self> {
+        let host = crate::config::Config::global()
+            .get_param("ANTHROPIC_HOST")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+
+        let auth = AuthMethod::ApiKey {
+            header_name: "x-api-key".to_string(),
+            key: api_key.to_string(),
+        };
+
+        let api_client =
+            ApiClient::new(host, auth)?.with_header("anthropic-version", ANTHROPIC_API_VERSION)?;
+
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            custom_headers: None,
+            name: ANTHROPIC_PROVIDER_NAME.to_string(),
+            custom_models: None,
         })
     }
 
@@ -189,6 +218,90 @@ impl AnthropicProvider {
             .collect();
         models.sort();
         Ok(models)
+    }
+
+    #[allow(dead_code)]
+    async fn post(
+        &self,
+        session_id: Option<&str>,
+        payload: &Value,
+    ) -> Result<ApiResponse, ProviderError> {
+        let mut request = self.api_client.request(session_id, "v1/messages");
+
+        for (key, value) in self.get_conditional_headers() {
+            request = request.header(key, value)?;
+        }
+
+        if let Some(custom_headers) = &self.custom_headers {
+            for (key, value) in custom_headers {
+                request = request.header(key, value)?;
+            }
+        }
+
+        println!("Anthropic Request payload: {}", payload);
+        eprintln!("Anthropic Request payload: {:?}", payload);
+
+        Ok(request.api_post(payload).await?)
+    }
+
+    #[allow(dead_code)]
+    fn anthropic_api_call_result(response: ApiResponse) -> Result<Value, ProviderError> {
+        match response.status {
+            StatusCode::OK => response.payload.ok_or_else(|| {
+                ProviderError::RequestFailed("Response body is not valid JSON".to_string())
+            }),
+            _ => {
+                if response.status == StatusCode::BAD_REQUEST {
+                    if let Some(error_msg) = response
+                        .payload
+                        .as_ref()
+                        .and_then(|p: &Value| p.get("error"))
+                        .and_then(|e: &Value| e.get("message"))
+                        .and_then(|m: &Value| m.as_str())
+                    {
+                        let msg = error_msg.to_string();
+                        if msg.to_lowercase().contains("too long")
+                            || msg.to_lowercase().contains("too many")
+                        {
+                            return Err(ProviderError::ContextLengthExceeded(msg));
+                        }
+                    }
+                }
+                Err(map_http_error_to_provider_error(
+                    response.status,
+                    response.payload,
+                ))
+            }
+        }
+    }
+
+    async fn get_session_metadata(&self, session_id: Option<&str>) -> Option<Value> {
+        let session_id = session_id?;
+        let session = crate::session::SessionManager::instance()
+            .get_session(session_id, false)
+            .await
+            .ok()?;
+
+        let websocket_headers = session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")?;
+
+        let user_id = websocket_headers.as_object().and_then(|headers| {
+            headers.iter().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("x-cow-security-context") {
+                    v.as_str().and_then(|s| {
+                        serde_json::from_str::<Value>(s).ok().and_then(|json| {
+                            json.get("ID")
+                                .and_then(|e| e.as_str().map(|s| s.to_string()))
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+        })?;
+
+        Some(json!({ "user_id": user_id }))
     }
 }
 
@@ -271,7 +384,8 @@ impl Provider for AnthropicProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let mut payload = create_request(model_config, system, messages, tools)?;
+        let metadata = self.get_session_metadata(Some(session_id)).await;
+        let mut payload = create_request(model_config, system, messages, tools, metadata)?;
         payload
             .as_object_mut()
             .unwrap()
@@ -285,6 +399,11 @@ impl Provider for AnthropicProvider {
                 let mut request = self.api_client.request(Some(session_id), "v1/messages");
                 for (key, value) in &conditional_headers {
                     request = request.header(key, value)?;
+                }
+                if let Some(custom_headers) = &self.custom_headers {
+                    for (key, value) in custom_headers {
+                        request = request.header(key, value)?;
+                    }
                 }
                 let resp = request.response_post(&payload).await?;
                 handle_status_openai_compat(resp).await

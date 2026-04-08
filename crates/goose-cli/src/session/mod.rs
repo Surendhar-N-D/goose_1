@@ -367,6 +367,7 @@ impl CliSession {
             envs: Envs::new(HashMap::new()),
             env_keys: Vec::new(),
             headers: HashMap::new(),
+            allowed_headers: Vec::new(),
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(timeout),
             bundled: None,
@@ -2097,6 +2098,7 @@ mod tests {
             timeout: Some(300),
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "name_from_host"
     )]
@@ -2112,6 +2114,7 @@ mod tests {
             timeout: Some(300),
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "port_and_path"
     )]
@@ -2127,6 +2130,7 @@ mod tests {
             timeout: Some(300),
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "different_port_and_path"
     )]

@@ -52,6 +52,7 @@ pub trait McpClientTrait: Send + Sync {
         name: &str,
         arguments: Option<JsonObject>,
         cancel_token: CancellationToken,
+        allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error>;
 
     fn get_info(&self) -> Option<&InitializeResult>;
@@ -137,13 +138,9 @@ impl GooseClient {
         self.working_dir.clone()
     }
 
+    #[cfg(test)]
     async fn set_session_id(&self, session_id: &str) {
-        let mut slot = self.session_id.lock().await;
-        assert!(
-            slot.as_deref().is_none_or(|s| s == session_id),
-            "McpClient received requests from different sessions"
-        );
-        *slot = Some(session_id.to_string());
+        *self.session_id.lock().await = Some(session_id.to_string());
     }
 
     async fn current_session_id(&self) -> Option<String> {
@@ -468,18 +465,24 @@ impl McpClient {
         request: ClientRequest,
         cancel_token: CancellationToken,
     ) -> Result<ServerResult, Error> {
+        // session_id is injected into the request's MCP extensions metadata so the
+        // server (and our own `create_message` callback via `resolve_session_id`) can
+        // identify the originating session without relying on mutable shared state.
         let request = inject_session_context_into_request(request, Some(session_id), working_dir);
-        // The inner mutex is held only for the send; the actual response wait
-        // happens outside the lock so concurrent calls can overlap.
+
+        // Hold the client mutex only long enough to send the request.
+        // The response wait happens outside the lock so concurrent sessions can
+        // send their requests without blocking on each other's responses.
         let handle = {
             let client = self.client.lock().await;
-            client.service().set_session_id(session_id).await;
-            client
+            let result = client
                 .send_cancellable_request(request, PeerRequestOptions::no_options())
-                .await
+                .await;
+            result
         }?;
 
-        await_response(handle, self.timeout, &cancel_token).await
+        let result = await_response(handle, self.timeout, &cancel_token).await;
+        result
     }
 }
 
@@ -533,9 +536,13 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListResourcesRequest(RequestOptionalParam::with_param(
-                    PaginatedRequestParams::default().with_cursor(cursor),
-                )),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListResourcesRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -556,9 +563,11 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ReadResourceRequest(Request::new(ReadResourceRequestParams::new(
-                    uri.to_string(),
-                ))),
+                {
+                    let mut req = Request::new(ReadResourceRequestParams::new(uri.to_string()));
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ReadResourceRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -579,9 +588,13 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListToolsRequest(RequestOptionalParam::with_param(
-                    PaginatedRequestParams::default().with_cursor(cursor),
-                )),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListToolsRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -598,12 +611,21 @@ impl McpClientTrait for McpClient {
         name: &str,
         arguments: Option<JsonObject>,
         cancel_token: CancellationToken,
+        allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         let mut params = CallToolRequestParams::new(name.to_string());
         if let Some(args) = arguments {
             params = params.with_arguments(args);
         }
-        let request = ClientRequest::CallToolRequest(Request::new(params));
+        // Inject websocket headers from session, filtered by allowed_headers
+        let extensions = inject_session_headers_into_extensions(
+            Default::default(),
+            &ctx.session_id,
+            allowed_headers,
+        ).await;
+        let mut req = Request::new(params);
+        req.extensions = extensions;
+        let request = ClientRequest::CallToolRequest(req);
 
         let result = self
             .send_request_with_context(
@@ -630,9 +652,13 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListPromptsRequest(RequestOptionalParam::with_param(
-                    PaginatedRequestParams::default().with_cursor(cursor),
-                )),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListPromptsRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -662,7 +688,11 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::GetPromptRequest(Request::new(params)),
+                {
+                    let mut req = Request::new(params);
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::GetPromptRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -715,6 +745,69 @@ fn inject_session_context_into_extensions(
             WORKING_DIR_HEADER.to_string(),
             Value::String(working_dir.to_string()),
         );
+    }
+
+    extensions.insert(Meta(meta_map));
+    extensions
+}
+
+/// Injects dynamic headers from session into extensions, filtered by allowed_headers.
+///
+/// Only headers whose names appear in `allowed_headers` (case-insensitive) are
+/// forwarded. If `allowed_headers` is `None` or empty, **no** headers are forwarded.
+async fn inject_session_headers_into_extensions(
+    mut extensions: rmcp::model::Extensions,
+    session_id: &str,
+    allowed_headers: Option<Vec<String>>,
+) -> rmcp::model::Extensions {
+    use rmcp::model::Meta;
+
+    eprintln!("[MCP_CLIENT DEBUG] inject_session_headers_into_extensions called for session '{}', allowed_headers: {:?}", session_id, allowed_headers);
+
+    let mut meta_map = extensions
+        .get::<Meta>()
+        .map(|meta| meta.0.clone())
+        .unwrap_or_default();
+
+    // Build a lowercase set of allowed header names for case-insensitive matching.
+    // If allowed_headers is None or empty, no headers are forwarded.
+    let allowed_lower: Vec<String> = match &allowed_headers {
+        Some(list) if !list.is_empty() => list.iter().map(|h| h.to_lowercase()).collect(),
+        _ => {
+            eprintln!("[MCP_CLIENT DEBUG] No allowed_headers configured — skipping all websocket headers");
+            tracing::debug!("[MCP_CLIENT] No allowed_headers configured — skipping all websocket headers");
+            extensions.insert(Meta(meta_map));
+            return extensions;
+        }
+    };
+
+    // Inject dynamic headers from session if available
+    if let Ok(session) = crate::session::SessionManager::instance().get_session(session_id, false).await {
+        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+            if let Some(headers_obj) = headers_value.as_object() {
+                let mut headers_map = serde_json::Map::new();
+                for (key, value) in headers_obj {
+                    // Case-insensitive comparison: stored keys are lowercase (from Go),
+                    // config values may be mixed-case (e.g., "X-Origin-Host").
+                    if !allowed_lower.contains(&key.to_lowercase()) {
+                        tracing::debug!("[MCP_CLIENT] Skipping header '{}' — not in allowed_headers", key);
+                        continue;
+                    }
+                    headers_map.insert(key.clone(), value.clone());
+                }
+                tracing::debug!(
+                    "[MCP_CLIENT] Forwarding {} of {} websocket headers to MCP extension",
+                    headers_map.len(),
+                    headers_obj.len()
+                );
+                if !headers_map.is_empty() {
+                    eprintln!("[MCP_CLIENT DEBUG] Injecting websocket_headers into _meta: {:?}", headers_map.keys().collect::<Vec<_>>());
+                    meta_map.insert("websocket_headers".to_string(), Value::Object(headers_map));
+                } else {
+                    eprintln!("[MCP_CLIENT DEBUG] No matching websocket headers found after filtering");
+                }
+            }
+        }
     }
 
     extensions.insert(Meta(meta_map));

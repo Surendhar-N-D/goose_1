@@ -249,10 +249,13 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
             if let Some(content) = message.get_mut(CONTENT_FIELD) {
                 if let Some(content_array) = content.as_array_mut() {
                     if let Some(last_content) = content_array.last_mut() {
-                        last_content.as_object_mut().unwrap().insert(
-                            CACHE_CONTROL_FIELD.to_string(),
-                            json!({ TYPE_FIELD: "ephemeral" }),
-                        );
+                        let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+                        if !disable_cache {
+                            last_content.as_object_mut().unwrap().insert(
+                                CACHE_CONTROL_FIELD.to_string(),
+                                json!({ TYPE_FIELD: "ephemeral" }),
+                            );
+                        }
                     }
                 }
             }
@@ -293,10 +296,17 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
     // Add "cache_control" to the last tool spec, if any. This means that all tool definitions,
     // will be cached as a single prefix.
     if let Some(last_tool) = tool_specs.last_mut() {
-        last_tool.as_object_mut().unwrap().insert(
-            CACHE_CONTROL_FIELD.to_string(),
-            json!({ TYPE_FIELD: "ephemeral" }),
-        );
+        let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+        if !disable_cache {
+            let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
+            if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
+                cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
+            }
+            last_tool.as_object_mut().unwrap().insert(
+                CACHE_CONTROL_FIELD.to_string(),
+                cache_control,
+            );
+        }
     }
 
     tool_specs
@@ -304,11 +314,24 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
 
 /// Convert system message to Anthropic's API system specification
 pub fn format_system(system: &str) -> Value {
-    json!([{
+    let mut system_obj = json!({
         TYPE_FIELD: TEXT_TYPE,
-        TEXT_TYPE: system,
-        CACHE_CONTROL_FIELD: { TYPE_FIELD: "ephemeral" }
-    }])
+        TEXT_TYPE: system
+    });
+
+    let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+    if !disable_cache {
+        let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
+        if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
+            cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
+        }
+        system_obj.as_object_mut().unwrap().insert(
+            CACHE_CONTROL_FIELD.to_string(),
+            cache_control
+        );
+    }
+    
+    json!([system_obj])
 }
 
 /// Convert Anthropic's API response to internal Message format
@@ -511,9 +534,14 @@ pub fn create_request(
     system: &str,
     messages: &[Message],
     tools: &[Tool],
+    metadata: Option<Value>,
 ) -> Result<Value> {
     let anthropic_messages = format_messages(messages);
     let tool_specs = format_tools(tools);
+    {
+        let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+        eprintln!("[ANTHROPIC_TOOLS] Sending {} tools to LLM: {:?}", tools.len(), names);
+    }
     let system_spec = format_system(system);
 
     if anthropic_messages.is_empty() {
@@ -539,6 +567,14 @@ pub fn create_request(
             .as_object_mut()
             .unwrap()
             .insert("tools".to_string(), json!(tool_specs));
+    }
+
+    // Add metadata if present
+    if let Some(metadata) = metadata {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("metadata".to_string(), metadata);
     }
 
     if let Some(temp) = model_config.temperature {
@@ -1029,7 +1065,7 @@ mod tests {
         let mut config = cfg("claude-opus-4-6");
         config.max_tokens = Some(4096);
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[])?;
+        let payload = create_request(&config, "system", &messages, &[], None)?;
 
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
@@ -1056,7 +1092,7 @@ mod tests {
         config.request_params = Some(params);
 
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[])?;
+        let payload = create_request(&config, "system", &messages, &[], None)?;
 
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert_eq!(payload["thinking"]["budget_tokens"], 10000);
@@ -1074,7 +1110,7 @@ mod tests {
 
         let config = cfg("claude-sonnet-4-20250514");
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[])?;
+        let payload = create_request(&config, "system", &messages, &[], None)?;
 
         assert!(payload.get("thinking").is_none());
         assert!(payload.get("output_config").is_none());

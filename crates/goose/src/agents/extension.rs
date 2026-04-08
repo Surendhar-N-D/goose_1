@@ -232,6 +232,9 @@ pub enum ExtensionConfig {
         env_keys: Vec<String>,
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// List of allowed header names that can be passed from websocket
+        #[serde(default)]
+        allowed_headers: Vec<String>,
         // NOTE: set timeout to be optional for compatibility.
         // However, new configurations should include this field.
         timeout: Option<u64>,
@@ -293,6 +296,7 @@ impl Default for ExtensionConfig {
 }
 
 impl ExtensionConfig {
+
     pub fn streamable_http<S: Into<String>, T: Into<u64>>(
         name: S,
         uri: S,
@@ -305,6 +309,7 @@ impl ExtensionConfig {
             envs: Envs::default(),
             env_keys: Vec::new(),
             headers: HashMap::new(),
+            allowed_headers: Vec::new(),
             description: description.into(),
             timeout: Some(timeout.into()),
             bundled: None,
@@ -462,6 +467,7 @@ impl ExtensionConfig {
                 timeout,
                 bundled,
                 available_tools,
+                allowed_headers,
             } => {
                 let merged = merge_environments(&envs, &env_keys, &name, config).await?;
                 let headers = headers
@@ -481,9 +487,18 @@ impl ExtensionConfig {
                     timeout,
                     bundled,
                     available_tools,
+                    allowed_headers,
                 })
             }
             other => Ok(other),
+        }
+    }
+
+    /// Get allowed headers for this extension
+    pub fn allowed_headers(&self) -> Vec<String> {
+        match self {
+            Self::StreamableHttp { allowed_headers, .. } => allowed_headers.clone(),
+            _ => Vec::new(),
         }
     }
 }
@@ -681,6 +696,7 @@ available_tools: []
             timeout: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -701,6 +717,7 @@ available_tools: []
             timeout: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "header_substitution"
     )]
@@ -774,6 +791,7 @@ available_tools: []
             timeout: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -791,6 +809,7 @@ available_tools: []
             timeout: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "http_env_key_and_header_substitution"
     )]
@@ -802,6 +821,7 @@ available_tools: []
             envs: extension::Envs::default(),
             env_keys: vec!["MY_SECRET".into()],
             headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
             timeout: None,
             bundled: None,
             available_tools: vec![],
@@ -817,6 +837,7 @@ available_tools: []
             }),
             env_keys: vec![],
             headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
             timeout: None,
             bundled: None,
             available_tools: vec![],
