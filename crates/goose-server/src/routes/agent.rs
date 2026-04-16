@@ -75,6 +75,13 @@ pub struct StartAgentRequest {
     recipe_deeplink: Option<String>,
     #[serde(default)]
     extension_overrides: Option<Vec<ExtensionConfig>>,
+    /// Optional initial extension_data entries (e.g. websocket_headers.v0,
+    /// cow_tenant.v0) to store on the session BEFORE background extension
+    /// loading kicks in. Prevents the race where the first MCP handshake
+    /// happens without the session's forwarded headers.
+    /// Keys use the flat "extension_name.version" form (e.g. "websocket_headers.v0").
+    #[serde(default)]
+    extension_data: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -207,6 +214,7 @@ async fn start_agent(
         recipe_id,
         recipe_deeplink,
         extension_overrides,
+        extension_data: initial_extension_data,
     } = payload;
 
     let original_recipe = if let Some(deeplink) = recipe_deeplink {
@@ -272,9 +280,31 @@ async fn start_agent(
 
     let mut extension_data = session.extension_data.clone();
     let extensions_state = EnabledExtensionsState::new(extensions_to_use);
-    if let Err(e) = extensions_state.to_extension_data(&mut extension_data) {
-        tracing::warn!("Failed to initialize session with extensions: {}", e);
-    } else {
+    let mut any_changes = false;
+    match extensions_state.to_extension_data(&mut extension_data) {
+        Ok(()) => any_changes = true,
+        Err(e) => tracing::warn!("Failed to initialize session with extensions: {}", e),
+    }
+
+    // Merge any caller-supplied extension_data upfront so background extension
+    // loading sees these keys on the initial MCP handshake (eliminates the race
+    // where Go's follow-up PUT /sessions/{id}/extension_data arrives too late).
+    // Keys arrive as "name.version" (e.g. "websocket_headers.v0").
+    if let Some(initial) = initial_extension_data {
+        for (key, value) in initial {
+            if let Some((ext_name, version)) = key.rsplit_once('.') {
+                extension_data.set_extension_state(ext_name, version, value);
+            } else {
+                tracing::warn!(
+                    "Ignoring initial extension_data key '{}' (expected 'name.version' format)",
+                    key
+                );
+            }
+        }
+        any_changes = true;
+    }
+
+    if any_changes {
         manager
             .update(&session.id)
             .extension_data(extension_data.clone())
