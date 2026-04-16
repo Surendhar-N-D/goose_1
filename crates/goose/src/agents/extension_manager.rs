@@ -1019,7 +1019,12 @@ impl ExtensionManager {
                     mcpui: self.capabilities.mcpui,
                 };
 
-                let session_id = crate::session_context::current_session_id();
+                // Prefer the explicit session_id passed by the caller (set even when
+                // this runs inside a tokio::spawn without the SESSION_ID task_local).
+                // Fall back to the task_local only if no caller context was provided.
+                let effective_session_id = session_id
+                    .map(|s| s.to_string())
+                    .or_else(crate::session_context::current_session_id);
                 let client = create_streamable_http_client(
                     &resolved_uri,
                     *timeout,
@@ -1032,7 +1037,7 @@ impl ExtensionManager {
                     self.mcp_client_capabilities(),
                     &effective_working_dir,
                     allowed_headers,
-                    session_id.as_deref(),
+                    effective_session_id.as_deref(),
                 )
                 .await?;
                 (client, Some(resolved_headers))
@@ -1425,13 +1430,23 @@ impl ExtensionManager {
     }
 
     async fn fetch_all_tools(&self, session_id: &str) -> ExtensionResult<Vec<Tool>> {
-        let clients: Vec<_> = self
+        // Collect (name, config) first, then resolve clients through get_server_client
+        // so StreamableHttp extensions use their per-session client (which has the
+        // right session_id wired into DynamicHeaderClient for websocket-header forwarding).
+        let ext_meta: Vec<(String, ExtensionConfig)> = self
             .extensions
             .read()
             .await
             .iter()
-            .map(|(name, ext)| (name.clone(), ext.config.clone(), ext.get_client()))
+            .map(|(name, ext)| (name.clone(), ext.config.clone()))
             .collect();
+
+        let mut clients: Vec<(String, ExtensionConfig, McpClientBox)> = Vec::with_capacity(ext_meta.len());
+        for (name, config) in ext_meta {
+            if let Some(client) = self.get_server_client(name.clone(), Some(session_id)).await {
+                clients.push((name, config, client));
+            }
+        }
 
         let cancel_token = CancellationToken::default();
         let client_futures = clients.into_iter().map(|(name, config, client)| {
@@ -1607,13 +1622,19 @@ impl ExtensionManager {
     ) -> Result<Vec<(String, Resource)>, ErrorData> {
         let mut ui_resources = Vec::new();
 
-        let extensions_to_check: Vec<(String, McpClientBox)> = {
+        let extension_names: Vec<String> = {
             let extensions = self.extensions.read().await;
-            extensions
-                .iter()
-                .map(|(name, ext)| (name.clone(), ext.get_client()))
-                .collect()
+            extensions.keys().cloned().collect()
         };
+
+        let mut extensions_to_check: Vec<(String, McpClientBox)> = Vec::with_capacity(extension_names.len());
+        for name in extension_names {
+            // Resolve via get_server_client so StreamableHttp extensions use their
+            // per-session client (which has session_id wired for header forwarding).
+            if let Some(client) = self.get_server_client(name.clone(), Some(session_id)).await {
+                extensions_to_check.push((name, client));
+            }
+        }
 
         for (extension_name, client) in extensions_to_check {
             match client
