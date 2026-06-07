@@ -117,6 +117,7 @@ const EVENT_MESSAGE_STOP: &str = "message_stop";
 const EVENT_CONTENT_BLOCK_START: &str = "content_block_start";
 const EVENT_CONTENT_BLOCK_DELTA: &str = "content_block_delta";
 const EVENT_CONTENT_BLOCK_STOP: &str = "content_block_stop";
+const STOP_REASON_REFUSAL: &str = "refusal";
 
 /// Coerce a tool call's optional arguments into the JSON value Anthropic
 /// expects for the `input` field of a `tool_use` content block.
@@ -736,12 +737,41 @@ where
         signature: String,
     }
 
+
+    fn refusal_message(delta: &Value) -> String {
+        let stop_details = delta.get("stop_details");
+        let category = stop_details
+            .and_then(|details| details.get("category"))
+            .and_then(|value| value.as_str());
+        let explanation = stop_details
+            .and_then(|details| details.get("explanation"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty());
+
+        match (category, explanation) {
+            (Some(category), Some(explanation)) => {
+                format!(
+                    "The model refused to respond. Category: {category}. Explanation: {explanation}"
+                )
+            }
+            (Some(category), None) => {
+                format!("The model refused to respond. Category: {category}.")
+            }
+            (None, Some(explanation)) => {
+                format!("The model refused to respond. Explanation: {explanation}")
+            }
+            (None, None) => "The model refused to respond.".to_string(),
+        }
+    }
+
+
     try_stream! {
         let mut accumulated_tool_calls: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
         let mut current_tool_id: Option<String> = None;
         let mut final_usage: Option<crate::providers::base::ProviderUsage> = None;
         let mut message_id: Option<String> = None;
         let mut thinking: Option<ThinkingState> = None;
+        let mut refusal_sent = false;
 
         while let Some(line_result) = stream.next().await {
             let line = line_result?;
@@ -908,6 +938,20 @@ where
                     continue;
                 }
                 EVENT_MESSAGE_DELTA => {
+                    if let Some(delta) = event.data.get("delta") {
+                        if !refusal_sent
+                            && delta
+                                .get("stop_reason")
+                                .and_then(|value| value.as_str())
+                                == Some(STOP_REASON_REFUSAL)
+                        {
+                            let mut message = Message::assistant().with_text(refusal_message(delta));
+                            message.id = message_id.clone();
+                            refusal_sent = true;
+                            yield (Some(message), None);
+                        }
+                    }
+
                     if let Some(usage_data) = event.data.get("usage") {
                         let delta_usage = get_usage(usage_data).unwrap_or_default();
 
