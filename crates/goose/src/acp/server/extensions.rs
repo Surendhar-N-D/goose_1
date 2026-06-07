@@ -298,6 +298,7 @@ fn goose_extension_to_config(
                 socket,
                 bundled,
                 available_tools: Vec::new(),
+                allowed_headers: Vec::new(),
             },
             McpServer::Sse(_) => {
                 return Err(agent_client_protocol::Error::invalid_params()

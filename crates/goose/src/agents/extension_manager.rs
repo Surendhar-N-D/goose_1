@@ -658,8 +658,8 @@ async fn connect_with_auth(
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
     roots_dir: &std::path::Path,
-    allowed_headers: &[String],
-    session_id: Option<&str>,
+    _allowed_headers: &[String],
+    _session_id: Option<&str>,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
     let mut auth_headers = HeaderMap::new();
     auth_headers.insert(reqwest::header::USER_AGENT, GOOSE_USER_AGENT);
@@ -787,6 +787,8 @@ async fn create_streamable_http_client(
                     client_name,
                     capabilities,
                     roots_dir,
+                    allowed_headers, 
+                    session_id
                 )
                 .await;
             }
@@ -821,6 +823,8 @@ async fn create_streamable_http_client(
                     client_name,
                     capabilities,
                     roots_dir,
+                    allowed_headers, 
+                    session_id
                 )
                 .await
             }
@@ -1015,9 +1019,6 @@ impl ExtensionManager {
                     .collect();
                 // Session-specific websocket headers are handled dynamically per-request
                 // by the DynamicHeaderClient wrapper (no need to bake them into default_headers).
-                let capability = GooseMcpClientCapabilities {
-                    mcpui: self.capabilities.mcpui,
-                };
 
                 // Prefer the explicit session_id passed by the caller (set even when
                 // this runs inside a tokio::spawn without the SESSION_ID task_local).
@@ -1025,6 +1026,7 @@ impl ExtensionManager {
                 let effective_session_id = session_id
                     .map(|s| s.to_string())
                     .or_else(crate::session_context::current_session_id);
+                let resolved_socket = socket.as_ref().map(|s| substitute_env_vars(s, &all_envs));
                 let client = create_streamable_http_client(
                     &resolved_uri,
                     *timeout,
@@ -1560,7 +1562,7 @@ impl ExtensionManager {
     pub async fn read_resource_tool(
         &self,
         session_id: &str,
-        paramget_server_clients: Value,
+        params: Value,
         cancellation_token: CancellationToken,
     ) -> Result<Vec<Content>, ErrorData> {
         let uri = require_str_parameter(&params, "uri")?;
@@ -1812,7 +1814,7 @@ impl ExtensionManager {
 
         if let Some((prefix, actual)) = tool_name.split_once("__") {
             let owner = name_to_key(prefix);
-            if let Some(client) = self.get_server_client(&owner).await {
+            if let Some(client) = self.get_server_client(&owner, Some(session_id)).await {
                 return Ok(ResolvedTool {
                     tool_name: tool_name.to_string(),
                     extension_name: owner,
@@ -2134,10 +2136,6 @@ impl ExtensionManager {
 
                 let headers = resolved_headers.unwrap_or_default();
 
-                let capability = GooseMcpClientCapabilities {
-                    mcpui: self.capabilities.mcpui,
-                };
-
                 let roots_dir = std::env::var("GOOSE_WORKING_DIR")
                     .ok()
                     .map(PathBuf::from)
@@ -2147,9 +2145,11 @@ impl ExtensionManager {
                     *timeout,
                     &headers,
                     name,
+                    None,
+                    Box::new(GooseCredentialStore::new(name.to_string())),
                     self.provider.clone(),
                     self.client_name.clone(),
-                    capability,
+                    self.mcp_client_capabilities(),
                     &roots_dir,
                     allowed_headers,
                     Some(sid),

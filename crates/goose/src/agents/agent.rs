@@ -1780,9 +1780,9 @@ impl Agent {
         let session_manager = self.config.session_manager.clone();
         let session_id = session_config.id.clone();
         if !self.config.disable_session_naming {
-            let provider = provider.clone();
             let manager_for_spawn = session_manager.clone();
             let provider_for_naming = Arc::clone(&session_provider);
+            let session_name_update_tx = self.config.session_name_update_tx.clone();
             tokio::spawn(async move {
                 match manager_for_spawn
                     .maybe_update_name(&session_id, provider_for_naming)

@@ -84,6 +84,7 @@ impl McpClientTrait for SkillsClient {
         name: &str,
         arguments: Option<JsonObject>,
         _cancellation_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         if name != "load_skill" {
             return Ok(CallToolResult::error(vec![Content::text(format!(

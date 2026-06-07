@@ -203,6 +203,9 @@ impl AnthropicProvider {
             custom_headers: None,
             name: ANTHROPIC_PROVIDER_NAME.to_string(),
             custom_models: None,
+            dynamic_models: None,
+            skip_canonical_filtering: false,
+            format_options: AnthropicFormatOptions::default(),
         })
     }
 
@@ -306,6 +309,7 @@ impl AnthropicProvider {
                 Err(map_http_error_to_provider_error(
                     response.status,
                     response.payload,
+                    "v1/messages",
                 ))
             }
         }

@@ -624,7 +624,6 @@ pub fn create_request(
     system: &str,
     messages: &[Message],
     tools: &[Tool],
-    metadata: Option<Value>,
 ) -> Result<Value> {
     create_request_with_options(
         model_config,
@@ -632,7 +631,7 @@ pub fn create_request(
         messages,
         tools,
         AnthropicFormatOptions::default(),
-        metadata,
+        None,
     )
 }
 
