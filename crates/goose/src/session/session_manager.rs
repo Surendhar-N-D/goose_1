@@ -499,15 +499,6 @@ impl SessionManager {
             return Ok(None);
         }
 
-        if let Some(recipe) = &session.recipe {
-            let name = recipe.title.trim().to_string();
-            if name.is_empty() || session.name == name {
-                return Ok(None);
-            }
-
-            return Ok(Some(self.system_generated_name_update(id, name).await?));
-        }
-
         let model_config = match session.model_config.clone() {
             Some(model_config) => model_config,
             None => {
@@ -533,7 +524,7 @@ impl SessionManager {
             .filter(|m| matches!(m.role, Role::User))
             .count();
 
-        if user_message_count <= MSG_COUNT_FOR_SESSION_NAME_GENERATION {
+        if user_message_count > 0 && user_message_count <= MSG_COUNT_FOR_SESSION_NAME_GENERATION {
             let name =
                 generate_session_name(provider.as_ref(), &model_config, id, &conversation).await?;
             return Ok(Some(self.system_generated_name_update(id, name).await?));
