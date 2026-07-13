@@ -288,6 +288,16 @@ impl Agent {
         let model_config =
             model_config.with_default_thinking_effort(Config::global().get_goose_thinking_effort());
         debug!("WAITING_LLM_STREAM_START");
+
+        if let Ok(payload_json) = serde_json::to_string(&serde_json::json!({
+            "model": model_config.model_name,
+            "system": system_prompt,
+            "messages": messages_for_provider.messages(),
+            "tools": tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        })) {
+            tracing::info!("Sending LLM Payload: {}", payload_json);
+        }
+
         let stream_result = crate::session_context::with_session_id(
             Some(session_id.to_string()),
             provider.stream(

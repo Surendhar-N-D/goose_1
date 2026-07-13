@@ -62,6 +62,7 @@ pub struct DelegateParams {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub r#async: bool,
+    pub subagent_session_id: Option<String>,
 }
 
 pub struct BackgroundTask {
@@ -545,7 +546,7 @@ impl SummonClient {
     }
 
     fn create_delegate_tool(&self) -> Tool {
-        let schema = serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "instructions": {
@@ -599,9 +600,23 @@ impl SummonClient {
             }
         });
 
-        Tool::new(
-            "delegate",
-            "Delegate a task to a subagent that runs independently with its own context.\n\n\
+        let resume_enabled = std::env::var("GOOSE_SUBAGENT_RESUME")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        if resume_enabled {
+            if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                props.insert(
+                    "subagent_session_id".to_string(),
+                    serde_json::json!({
+                        "type": "string",
+                        "description": "Optional subagent session ID to resume a previous subagent session."
+                    }),
+                );
+            }
+        }
+
+        let mut description = "Delegate a task to a subagent that runs independently with its own context.\n\n\
              Modes:\n\
              1. Ad-hoc: Provide `instructions` for a custom task\n\
              2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
@@ -610,10 +625,20 @@ impl SummonClient {
              - Delegates know only instructions + source content\n\
              - Delegates cannot coordinate. Same-file work = conflicts.\n\
              - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
-             Research (read-only): parallelize freely - delegates explore and report back.\n\
+             Research (read-only): parallelize freely - delegates explore and report back.\n\n\
              Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
              Decompose → async delegates → load(taskId) for each → synthesize."
-                .to_string(),
+            .to_string();
+
+        if resume_enabled {
+            description.push_str("\n\n\
+                 Resuming Sessions:\n\
+                 - If a prior delegate call returned a `[Subagent Session ID: <id>]` and you need to continue that flow (e.g., to answer a question the subagent asked), pass that ID as `subagent_session_id`. This lets the subagent resume with its history.");
+        }
+
+        Tool::new(
+            "delegate",
+            description,
             schema.as_object().unwrap().clone(),
         )
     }
@@ -1254,17 +1279,73 @@ impl SummonClient {
         )
         .with_use_login_shell_path(self.context.use_login_shell_path);
 
-        let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                task_config.parent_working_dir.clone(),
-                "Delegated task".to_string(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+        let resume_enabled = std::env::var("GOOSE_SUBAGENT_RESUME")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let subagent_session = if resume_enabled {
+            if let Some(ref id) = params.subagent_session_id {
+                self.context
+                    .session_manager
+                    .get_session(id, true)
+                    .await
+                    .map_err(|e| format!("Failed to load existing subagent session {}: {}", id, e))?
+            } else {
+                let s = self.context
+                    .session_manager
+                    .create_session(
+                        task_config.parent_working_dir.clone(),
+                        "Delegated task".to_string(),
+                        SessionType::SubAgent,
+                        GooseMode::Auto,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+                
+                // Copy parent's specific extension_data keys
+                let mut sub_ext_data = crate::session::extension_data::ExtensionData::new();
+                if let Some(state) = session.extension_data.extension_states.get("cow_tenant.v0") {
+                    sub_ext_data.extension_states.insert("cow_tenant.v0".to_string(), state.clone());
+                }
+                if let Some(state) = session.extension_data.extension_states.get("websocket_headers.v0") {
+                    sub_ext_data.extension_states.insert("websocket_headers.v0".to_string(), state.clone());
+                }
+                self.context.session_manager
+                    .update(&s.id)
+                    .extension_data(sub_ext_data)
+                    .apply()
+                    .await
+                    .map_err(|e| format!("Failed to copy parent session headers to subagent: {}", e))?;
+                s
+            }
+        } else {
+            let s = self.context
+                .session_manager
+                .create_session(
+                    task_config.parent_working_dir.clone(),
+                    "Delegated task".to_string(),
+                    SessionType::SubAgent,
+                    GooseMode::Auto,
+                )
+                .await
+                .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+            
+            // Copy parent's specific extension_data keys
+            let mut sub_ext_data = crate::session::extension_data::ExtensionData::new();
+            if let Some(state) = session.extension_data.extension_states.get("cow_tenant.v0") {
+                sub_ext_data.extension_states.insert("cow_tenant.v0".to_string(), state.clone());
+            }
+            if let Some(state) = session.extension_data.extension_states.get("websocket_headers.v0") {
+                sub_ext_data.extension_states.insert("websocket_headers.v0".to_string(), state.clone());
+            }
+            self.context.session_manager
+                .update(&s.id)
+                .extension_data(sub_ext_data)
+                .apply()
+                .await
+                .map_err(|e| format!("Failed to copy parent session headers to subagent: {}", e))?;
+            s
+        };
 
         let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
         Self::spawn_notification_bridge(
@@ -1290,18 +1371,32 @@ impl SummonClient {
         let mut meta = Meta::new();
         meta.0.insert(
             "subagent_session_id".to_string(),
-            serde_json::Value::String(subagent_session_id),
+            serde_json::Value::String(subagent_session_id.clone()),
         );
 
         match result {
             Ok(text) => {
-                Ok(CallToolResult::success(vec![Content::text(text)]).with_meta(Some(meta)))
+                let response_text = if resume_enabled {
+                    format!(
+                        "{}\n\n[Subagent Session ID: {}]",
+                        text, subagent_session_id
+                    )
+                } else {
+                    text
+                };
+                Ok(CallToolResult::success(vec![Content::text(response_text)]).with_meta(Some(meta)))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Delegation failed: {}",
-                e
-            ))])
-            .with_meta(Some(meta))),
+            Err(e) => {
+                let response_text = if resume_enabled {
+                    format!(
+                        "Delegation failed: {}\n\n[Subagent Session ID: {}]",
+                        e, subagent_session_id
+                    )
+                } else {
+                    format!("Delegation failed: {}", e)
+                };
+                Ok(CallToolResult::error(vec![Content::text(response_text)]).with_meta(Some(meta)))
+            }
         }
     }
 
@@ -1534,6 +1629,15 @@ impl SummonClient {
             Some(&session.extension_data),
             Config::global(),
         );
+
+        // Merge the sub-recipe's declared extensions into the subagent configuration
+        if let Some(recipe_exts) = &recipe.extensions {
+            for ext in recipe_exts {
+                if !extensions.iter().any(|e| e.name() == ext.name()) {
+                    extensions.push(ext.clone());
+                }
+            }
+        }
 
         if let Some(filter) = &params.extensions {
             if filter.is_empty() {
@@ -1804,17 +1908,73 @@ impl SummonClient {
         )
         .with_use_login_shell_path(self.context.use_login_shell_path);
 
-        let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                task_config.parent_working_dir.clone(),
-                description.clone(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+        let resume_enabled = std::env::var("GOOSE_SUBAGENT_RESUME")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let subagent_session = if resume_enabled {
+            if let Some(ref id) = params.subagent_session_id {
+                self.context
+                    .session_manager
+                    .get_session(id, true)
+                    .await
+                    .map_err(|e| format!("Failed to load existing subagent session {}: {}", id, e))?
+            } else {
+                let s = self.context
+                    .session_manager
+                    .create_session(
+                        task_config.parent_working_dir.clone(),
+                        description.clone(),
+                        SessionType::SubAgent,
+                        GooseMode::Auto,
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+                
+                // Copy parent's specific extension_data keys
+                let mut sub_ext_data = crate::session::extension_data::ExtensionData::new();
+                if let Some(state) = session.extension_data.extension_states.get("cow_tenant.v0") {
+                    sub_ext_data.extension_states.insert("cow_tenant.v0".to_string(), state.clone());
+                }
+                if let Some(state) = session.extension_data.extension_states.get("websocket_headers.v0") {
+                    sub_ext_data.extension_states.insert("websocket_headers.v0".to_string(), state.clone());
+                }
+                self.context.session_manager
+                    .update(&s.id)
+                    .extension_data(sub_ext_data)
+                    .apply()
+                    .await
+                    .map_err(|e| format!("Failed to copy parent session headers to subagent: {}", e))?;
+                s
+            }
+        } else {
+            let s = self.context
+                .session_manager
+                .create_session(
+                    task_config.parent_working_dir.clone(),
+                    description.clone(),
+                    SessionType::SubAgent,
+                    GooseMode::Auto,
+                )
+                .await
+                .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+            
+            // Copy parent's specific extension_data keys
+            let mut sub_ext_data = crate::session::extension_data::ExtensionData::new();
+            if let Some(state) = session.extension_data.extension_states.get("cow_tenant.v0") {
+                sub_ext_data.extension_states.insert("cow_tenant.v0".to_string(), state.clone());
+            }
+            if let Some(state) = session.extension_data.extension_states.get("websocket_headers.v0") {
+                sub_ext_data.extension_states.insert("websocket_headers.v0".to_string(), state.clone());
+            }
+            self.context.session_manager
+                .update(&s.id)
+                .extension_data(sub_ext_data)
+                .apply()
+                .await
+                .map_err(|e| format!("Failed to copy parent session headers to subagent: {}", e))?;
+            s
+        };
 
         let task_id = subagent_session.id.clone();
 
