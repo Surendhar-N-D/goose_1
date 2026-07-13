@@ -1779,7 +1779,33 @@ impl SummonClient {
             .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
 
         let model_config = self.resolve_model_config(params, recipe, session, &provider_name)?;
-        let provider = providers::create(&provider_name, Vec::new()).await?;
+        let mut api_key: Option<String> = None;
+        let mut host: Option<String> = None;
+
+        if let Some(headers_obj) = session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")
+            .and_then(|value| value.as_object())
+        {
+            for (key, value) in headers_obj {
+                let key_lower = key.to_lowercase();
+                if key_lower == "x-api-key" {
+                    if let Some(val_str) = value.as_str() {
+                        api_key = Some(val_str.to_string());
+                    }
+                } else if key_lower == "x-openai-host" || key_lower == "x-anthropic-host" || key_lower == "x-host" {
+                    if let Some(val_str) = value.as_str() {
+                        host = Some(val_str.to_string());
+                    }
+                }
+            }
+        }
+
+        let provider = if let Some(key) = api_key {
+            providers::create_with_api_key(&provider_name, &key, host.as_deref())?
+        } else {
+            providers::create(&provider_name, Vec::new()).await?
+        };
         Ok((provider, model_config))
     }
 
