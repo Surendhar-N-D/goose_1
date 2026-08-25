@@ -34,7 +34,10 @@ ENV CARGO_PROFILE_RELEASE_STRIP=true
 RUN cargo build --release --package goose-cli
 
 # Runtime stage - minimal Debian
-FROM debian:bookworm-slim@sha256:b1a741487078b369e78119849663d7f1a5341ef2768798f7b7406c4240f86aef
+# Base image digest bumped to bust the GHA layer cache on the apt-get layer below,
+# which otherwise keeps serving the libssl3 fetched at first build (see CVE-2026-31789,
+# fixed in Debian bookworm-security as libssl3 3.0.20-1~deb12u2).
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 # Install only runtime dependencies
 RUN apt-get update && \
