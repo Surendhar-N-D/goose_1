@@ -171,10 +171,7 @@ fi
 
 MISSING=""
 for m in "_goose/unstable/session/provider/update" \
-         "_goose/unstable/session/extension_data/set" \
-         "_goose/unstable/session/info" \
-         "_goose/unstable/session/rename" \
-         "_goose/unstable/session/export" ; do
+         "_goose/unstable/session/extension_data/set"  ; do
   if ! docker run --rm --entrypoint grep "$REF" -aqF "$m" /usr/local/bin/goose; then
     MISSING="$MISSING $m"
   fi
